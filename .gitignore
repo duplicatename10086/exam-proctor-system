@@ -1,0 +1,21 @@
+# 编译产物
+build/
+dist/
+*.spec
+*.exe
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 题库（可能含真实题目和答案）
+题库/
+bank.json
+exam_data.json
+
+# 出题人敏感文件（私钥、令牌、答案对照表）
+*私钥*
+*令牌*
+*答案对照表*
+
+# 图标保留在仓库中（make_icon.py 可重新生成）
