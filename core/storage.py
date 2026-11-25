@@ -91,7 +91,8 @@ def _embed_media(paths: list[str]) -> list[dict]:
 
 def build_report(state: ExamState, pkg_secret: str, vm_info: dict,
                  qmap: dict = None, candidate_media: list[str] = None,
-                 candidate_media_map: dict = None) -> dict:
+                 candidate_media_map: dict = None,
+                 local_ai_signs: list[str] = None) -> dict:
     """组装完整报告；每题含题干附件、参考答案附件、考生本题作答附件。"""
     results = [dict(r) for r in state.result]
     cmap = candidate_media_map or {}
@@ -126,6 +127,8 @@ def build_report(state: ExamState, pkg_secret: str, vm_info: dict,
             "hardware": vm_info.get("hardware", ""),
             "key_violations": len([e for e in state.events if e["kind"] == "key_violation"]),
             "focus_loss": len([e for e in state.events if e["kind"] == "focus_loss"]),
+            "local_ai_detected": bool(local_ai_signs),
+            "local_ai_signs": list(local_ai_signs or []),
         },
     }
 
