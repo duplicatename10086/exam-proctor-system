@@ -74,6 +74,9 @@ class ExamApp:
         self.net = anticheat.NetworkLock(enabled=self.cfg.ac_network_lock)
         self.kbd = anticheat.KeyboardGuard(enabled=self.cfg.ac_block_keys)
         self.kbd.set_violation_callback(lambda v: self._ac_event("key_violation", v))
+        # 本地 AI 服务监测（防用惊云/Ollama 等本地模型查答案）
+        self.ai_watcher = anticheat.LocalAIWatcher(on_detect=self._on_local_ai)
+        self.local_ai_signs = []   # 本次考试检测到的 AI 服务迹象
         self.vm = {"suspected": False, "signs": [], "hardware": ""}
         self._tick_id = None
         self._answers_vars = {}
@@ -96,6 +99,22 @@ class ExamApp:
     # ---------- 反作弊事件回调 ----------
     def _ac_event(self, kind, detail=""):
         self.state.event(kind, detail)
+
+    def _on_local_ai(self, info: dict):
+        """检测到本地 AI 服务：记录 + 醒目告警（不打断答题）。"""
+        signs = info.get("signs", [])
+        self.local_ai_signs.extend(signs)
+        self.state.event("local_ai_detected", "; ".join(signs))
+        self._save()
+        # 弹一次醒目告警（每个新迹象都提示，但 watcher 已去重）
+        try:
+            messagebox.showwarning(
+                "反作弊警告",
+                "检测到本机正在运行本地 AI 模型服务（如惊云/Ollama/LM Studio）。\n"
+                "考试期间使用 AI 辅助作答属于违规行为，已记入报告：\n\n"
+                + "\n".join("• " + s for s in signs))
+        except Exception:
+            pass
 
     def _upload_answer_media(self, qid=None):
         """考生为当前题上传作答附件（图片/视频），按题存储，附进报告。"""
@@ -209,6 +228,20 @@ class ExamApp:
         if self.cfg.ac_network_lock:
             self.net.disable()
             self.state.event("network_lock", "普通题阶段网络已锁定")
+        # 启动本地 AI 服务监测 + 立即检测一次
+        self.ai_watcher.start()
+        try:
+            initial_ai = anticheat.detect_local_ai()
+            if initial_ai["suspected"]:
+                for s in initial_ai["signs"]:
+                    if s not in self.local_ai_signs:
+                        self.local_ai_signs.append(s)
+                        self.state.event("local_ai_detected", s)
+                messagebox.showwarning("反作弊提醒",
+                    "开局检测到本机正在运行本地 AI 模型服务，本次考试将被标记：\n\n"
+                    + "\n".join("• " + s for s in initial_ai["signs"]))
+        except Exception:
+            pass
 
         # 抽题
         self._draw_questions()
@@ -225,6 +258,7 @@ class ExamApp:
             anticheat.make_fullscreen(self.root)
         if self.cfg.ac_block_keys:
             self.kbd.hook()
+        self.ai_watcher.start()
         self._build_exam_ui()
 
     # ---------- 抽题 ----------
@@ -509,6 +543,17 @@ class ExamApp:
         self.state.submit_wall = time.time()
         self.state.status = "submitted"
         self.state.event("submit", "自动交卷" if auto else "考生主动交卷")
+        self.ai_watcher.stop()
+        # 交卷瞬间再做一次 AI 服务检测
+        try:
+            final_ai = anticheat.detect_local_ai()
+            if final_ai["suspected"]:
+                for s in final_ai["signs"]:
+                    if s not in self.local_ai_signs:
+                        self.local_ai_signs.append(s)
+                        self.state.event("local_ai_detected", s)
+        except Exception:
+            pass
 
         # 恢复网络（交卷后释放防护）
         if self.cfg.ac_network_lock:
@@ -525,7 +570,8 @@ class ExamApp:
         # 生成只读报告（含题干附件 + 参考答案附件 + 每题考生作答附件）
         cand_map = dict(self.state.candidate.get("_answer_media", {}))
         report = build_report(self.state, self.pkg.secret, self.vm,
-                              qmap=self._qmap, candidate_media_map=cand_map)
+                              qmap=self._qmap, candidate_media_map=cand_map,
+                              local_ai_signs=self.local_ai_signs)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         rpath = os.path.join(os.path.expanduser("~"),
                              "报告_%s_%s.json" % (self.state.candidate.get("name", "考生"), stamp))
