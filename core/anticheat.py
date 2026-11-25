@@ -18,6 +18,7 @@ import ctypes
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -333,3 +334,119 @@ def protect_process():
     except Exception as e:
         _log("critical_err", str(e))
         return False
+
+
+# =====================================================================
+# 7. 本地 AI 服务检测（防「用本地大模型查答案」）
+# =====================================================================
+# 常见的本地大模型服务端口（llama.cpp / Ollama / LM Studio / vLLM 等）
+AI_PORTS = {8088, 11434, 1234, 8000, 8001, 5000, 5001, 7860, 11435}
+# 常见本地 AI 服务进程名关键字
+AI_PROCESS_KEYWORDS = (
+    "llama-server", "llama.exe", "ollama", "ollama_llama_server",
+    "lm studio", "vllm", "koboldcpp", "text-generation-webui",
+)
+
+
+def detect_local_ai() -> dict:
+    """
+    检测本机是否运行着本地 AI 模型服务。
+    返回 {"suspected": bool, "signs": [...]}。
+    检测维度：监听端口 + 进程名 + OpenAI 兼容 API 探测。
+    """
+    signs = []
+    # --- 1) 端口监听 ---
+    listening = {}
+    if IS_WIN:
+        try:
+            out = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True, text=True, timeout=6).stdout
+            for line in out.splitlines():
+                if "LISTENING" not in line:
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                local = parts[1]
+                pid = parts[-1]
+                # 提取端口号
+                m = re.search(r":(\d+)$", local)
+                if m and int(m.group(1)) in AI_PORTS:
+                    listening[m.group(1)] = pid
+        except Exception:
+            pass
+    for port, pid in listening.items():
+        signs.append("本地AI端口监听:%s(PID %s)" % (port, pid))
+
+    # --- 2) 进程名 ---
+    found_procs = set()
+    if IS_WIN:
+        try:
+            out = subprocess.run(
+                ["tasklist"], capture_output=True, text=True, timeout=8).stdout
+            low = out.lower()
+            for kw in AI_PROCESS_KEYWORDS:
+                if kw.lower() in low:
+                    found_procs.add(kw)
+        except Exception:
+            pass
+    for kw in found_procs:
+        signs.append("AI进程关键字:%s" % kw)
+
+    # --- 3) 对命中的端口做 OpenAI API 探测（确认是真模型服务）---
+    api_confirmed = []
+    for port in listening:
+        try:
+            import urllib.request
+            req = urllib.request.Request("http://127.0.0.1:%s/v1/models" % port,
+                                         headers={"User-Agent": "examd"})
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status == 200:
+                    api_confirmed.append(port)
+        except Exception:
+            pass
+    for port in api_confirmed:
+        signs.append("OpenAI兼容API确认:端口%s" % port)
+
+    result = {"suspected": bool(signs), "signs": signs}
+    if signs:
+        _log("local_ai_detected", "; ".join(signs))
+    return result
+
+
+class LocalAIWatcher:
+    """考试期间周期性检测本地 AI 服务，发现则回调告警。"""
+    def __init__(self, on_detect: Optional[Callable[[dict], None]] = None,
+                 interval: float = 12.0):
+        self.interval = interval
+        self.on_detect = on_detect
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._reported = set()   # 去重：同一迹象只报一次
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        _log("local_ai_watcher", "本地AI监测已启动(间隔%ss)" % self.interval)
+
+    def stop(self):
+        self._stop.set()
+        _log("local_ai_watcher", "本地AI监测已停止")
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                r = detect_local_ai()
+                if r["suspected"]:
+                    # 只对新增迹象告警
+                    new = [s for s in r["signs"] if s not in self._reported]
+                    for s in new:
+                        self._reported.add(s)
+                    if new and self.on_detect:
+                        self.on_detect({"suspected": True, "signs": new})
+            except Exception:
+                pass
